@@ -1,0 +1,256 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/user"
+	"path/filepath"
+	"slices"
+	"strings"
+
+	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/client"
+	flags "github.com/jessevdk/go-flags"
+	"golang.org/x/sys/unix"
+)
+
+const DOCKER_API_VERSION = "1.39" // This is because of a client version error
+
+type Options struct {
+	ImageName  string `short:"i" long:"image" description:"Specify the name of the image you want to inspect."`
+	SocketPath string `short:"s" long:"socket" description:"Specify the path to the docker.sock file."`
+	OutputFile string `short:"o" long:"outfile" description:"Write the output --outfile."`
+}
+
+func getSocket() (socketName string, err error) {
+	// ~/.rd/docker.sock
+	// /var/run/docker.sock
+	user, err := user.Current()
+	if err != nil {
+		return "", err
+	}
+	socketName = filepath.Join(user.HomeDir, ".rd", "docker.sock")
+	return socketName, nil
+}
+
+func pathExistsAndIsWritable(path string) (err error) {
+	_, err = os.Stat(path)
+	if os.IsNotExist(err) {
+		return fmt.Errorf("the path %s does not exist - please choose another path", path)
+	}
+	ok := unix.Access(path, unix.W_OK)
+	if ok != nil {
+		return fmt.Errorf("the path %s is not writable - please choose another path", path)
+	}
+	return nil
+}
+
+func standardizeSpaces(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+func getStep(step string) string {
+	if strings.Contains(step, "#(nop)") {
+		stepBits := strings.Split(step, "#(nop) ")
+		return stepBits[1]
+	} else {
+		return fmt.Sprintf("RUN %s", step)
+	}
+}
+
+func main() {
+	var dockerCommands = []string{}
+	var err error
+	var fromImage = ""
+	var fromLastCreatedBy = ""
+	var imageFound = false
+	var layersWithImages = make(map[string]string)
+	var myImage image.Summary
+	var possibleFromImage = ""
+	var repoTag = ""
+	var socketName = ""
+
+	opts := Options{}
+
+	// Parse the options
+	parser := flags.NewParser(&opts, flags.Default)
+	parser.Usage = `--image <image_name:tag> [--socket /path/to/docker.sock]
+  dfimage extracts a Dockerfile from the specified image name and prints it to STDOUT.`
+	if _, err := parser.Parse(); err != nil {
+		if flagsErr, ok := err.(*flags.Error); ok && flagsErr.Type == flags.ErrHelp {
+			os.Exit(0)
+		} else {
+			os.Exit(1)
+		}
+	}
+
+	if opts.ImageName == "" {
+		fmt.Println("missing required option: --image")
+		os.Exit(1)
+	}
+
+	if opts.SocketPath == "" {
+		socketName, err = getSocket()
+		if err != nil {
+			fmt.Println("failed to find the docker socket - use --socket to specify the path to docker.sock")
+			os.Exit(1)
+		}
+	} else {
+		socketName = opts.SocketPath
+	}
+
+	if opts.OutputFile != "" {
+		var path = ""
+		if strings.Contains(opts.OutputFile, "/") {
+			// The option includes a path
+			path = filepath.Dir(opts.OutputFile)
+		} else {
+			// There is no path here, we test cwd
+			path, err = os.Getwd()
+			if err != nil {
+				fmt.Println("unable to detect the current working directory")
+				os.Exit(1)
+			}
+		}
+		err = pathExistsAndIsWritable(path)
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(0)
+		}
+	}
+
+	imageId := opts.ImageName
+
+	// Get the image name
+	if strings.Contains(imageId, ":") {
+		repoTag = imageId
+	} else {
+		repoTag = fmt.Sprintf("%s:latest", imageId)
+	}
+
+	// Create the client
+	// cli, err := client.NewClientWithOpts(client.FromEnv)
+	cli, err := client.NewClientWithOpts(
+		client.WithHost(fmt.Sprintf("unix://%s", socketName)),
+		client.WithVersion(DOCKER_API_VERSION),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	// Find the image in the list of imageList
+	imageList, err := cli.ImageList(context.Background(), image.ListOptions{})
+	if err != nil {
+		panic(err)
+	}
+
+	for _, img := range imageList {
+		imageBits := strings.Split(img.ID, ":")
+		if strings.HasPrefix(strings.ToLower(imageBits[1]), imageId) {
+			myImage = img
+			imageFound = true
+		} else if repoTag != "" && slices.Contains(img.RepoTags, repoTag) {
+			myImage = img
+			imageFound = true
+		}
+	}
+
+	if !imageFound {
+		fmt.Printf("the image \"%s\" was not found\n", repoTag)
+		fmt.Printf("please make sure you pull \"%s\" before using this utility", repoTag)
+		os.Exit(1)
+	}
+
+	// Get the image history
+	imageHistory, err := cli.ImageHistory(context.Background(), myImage.RepoTags[0])
+	if err != nil {
+		panic(err)
+	}
+
+	// Get layers with imageList
+	for _, img := range imageList {
+		inspect, _, err := cli.ImageInspectWithRaw(context.Background(), img.ID)
+		if err != nil {
+			panic(err)
+		}
+		layers := inspect.RootFS.Layers
+		if len(layers) > 0 {
+			lastLayerId := layers[len(layers)-1]
+			layersWithImages[lastLayerId] = img.RepoTags[0]
+		}
+	}
+
+	// Get from images
+	inspect, _, err := cli.ImageInspectWithRaw(context.Background(), myImage.ID)
+	if err != nil {
+		panic(err)
+	}
+	layers := inspect.RootFS.Layers
+	if len(layers) > 0 {
+		for _, layerId := range layers {
+			_, ok := layersWithImages[layerId]
+			if ok {
+				possibleFromImage = layersWithImages[layerId]
+				if possibleFromImage == myImage.RepoTags[0] {
+					continue
+				}
+				fromImage = layersWithImages[layerId]
+				break
+			}
+		}
+	}
+
+	// Parse history
+	if fromImage != "" {
+		fromImageHistory, err := cli.ImageHistory(context.Background(), fromImage)
+		if err != nil {
+			panic(err)
+		}
+		for _, fromImageEvent := range fromImageHistory {
+			fromLastCreatedBy = fromImageEvent.CreatedBy
+			break
+		}
+	}
+	for _, imageEvent := range imageHistory {
+		if fromLastCreatedBy != "" && imageEvent.CreatedBy == fromLastCreatedBy {
+			break
+		}
+		sanitizedCommand := standardizeSpaces(getStep(imageEvent.CreatedBy))
+		sanitizedCommand = strings.Replace(sanitizedCommand, "/bin/sh -c ", "", -1)
+		sanitizedCommand = strings.Replace(sanitizedCommand, "&&", "\n        &&", -1)
+		dockerCommands = append(dockerCommands, sanitizedCommand)
+		// dockerCommands = append(dockerCommands, standardizeSpaces(getStep(imageEvent.CreatedBy)))
+	}
+
+	if fromImage != "" {
+		dockerCommands = append(dockerCommands, fmt.Sprintf("FROM %s", fromImage))
+	} else {
+		dockerCommands = append(dockerCommands, "FROM <base image not found locally>")
+	}
+	slices.Reverse(dockerCommands)
+
+	if opts.OutputFile != "" {
+		// Check for permissions to write
+		// Check if the file already exists
+		// Do all of this before starting
+		f, err := os.OpenFile(opts.OutputFile, os.O_WRONLY|os.O_CREATE, 0644)
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		for _, dockerCommand := range dockerCommands {
+			_, err = f.WriteString(dockerCommand)
+			if err != nil {
+				fmt.Println(err)
+				os.Exit(1)
+			}
+		}
+		fmt.Printf("File successfully written to %s.\n", opts.OutputFile)
+	} else {
+		for _, dockerCommand := range dockerCommands {
+			fmt.Println(dockerCommand)
+		}
+	}
+}
