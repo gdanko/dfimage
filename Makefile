@@ -1,7 +1,10 @@
 GOPATH := $(shell go env GOPATH)
 GOOS := $(shell go env GOOS)
 GOARCH := $(shell go env GOARCH)
-DFIMAGE_VERSION := ${DFIMAGE_VERSION}
+DFIMAGE_VERSION := "0.1.0"
+
+GOOS ?= $(shell uname | tr '[:upper:]' '[:lower:]')
+GOARCH ?=$(shell arch)
 
 .PHONY: all build install
 
