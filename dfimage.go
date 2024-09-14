@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/user"
@@ -16,7 +17,7 @@ import (
 )
 
 const DOCKER_API_VERSION = "1.39" // This is because of a client version error
-const VERSION = "0.1.0"
+const VERSION = "0.1.1"
 
 type Options struct {
 	ImageName  string `short:"i" long:"image" description:"Specify the name of the image you want to inspect."`
@@ -25,15 +26,31 @@ type Options struct {
 	Version    func() `short:"V" long:"version" description:"Output version information and exit."`
 }
 
+func fileExists(path string) (exists bool) {
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	return true
+}
+
 func getSocket() (socketName string, err error) {
-	// ~/.rd/docker.sock
-	// /var/run/docker.sock
 	user, err := user.Current()
 	if err != nil {
 		return "", err
 	}
-	socketName = filepath.Join(user.HomeDir, ".rd", "docker.sock")
-	return socketName, nil
+	socketPaths := []string{
+		filepath.Join(user.HomeDir, ".rd", "docker.sock"),
+		filepath.Join(user.HomeDir, ".docker", "run", "docker.sock"),
+		"/var/run/docker.sock",
+	}
+
+	for _, socketPath := range socketPaths {
+		if fileExists(socketPath) {
+			return socketPath, nil
+		}
+	}
+
+	return "", errors.New("failed to find the docker socket - use --socket to specify the path to docker.sock")
 }
 
 func pathExistsAndIsWritable(path string) (err error) {
@@ -82,7 +99,7 @@ func processOptions(opts Options) (imageId string, socketName string, outputFile
 	if opts.SocketPath == "" {
 		socketName, err = getSocket()
 		if err != nil {
-			return "", "", "", fmt.Errorf("failed to find the docker socket - use --socket to specify the path to docker.sock")
+			return "", "", "", err
 		}
 	} else {
 		socketName = opts.SocketPath
