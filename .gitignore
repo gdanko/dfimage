@@ -22,6 +22,5 @@ go.work
 go.work.sum
 
 # Repo-specific stuff
-darwin/
-linux/
+dfimage
 *.tgz
