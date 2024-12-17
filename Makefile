@@ -20,23 +20,21 @@ build: guard-DFIMAGE_VERSION mod-tidy clean
 	@echo "Building dfimage"
 	@echo "=================================================\n"
 
-	@if [ ! -d "${GOOS}" ]; then \
-		mkdir "${GOOS}"; \
+	@if [ ! -d "bin" ]; then \
+		mkdir "bin"; \
 	fi
-	GOOS=${GOOS} GOARCH=${GOARCH} go build -o "${GOOS}/dfimage"
+	GOOS=${GOOS} GOARCH=${GOARCH} go build -o "bin/dfimage"
 	sleep 2
-	tar -C "${GOOS}" -czvf "dfimage_${DFIMAGE_VERSION}_${GOOS}_${GOARCH}.tgz" dfimage; \
+	tar -czvf "dfimage_${DFIMAGE_VERSION}_${GOOS}_${GOARCH}.tgz" bin; \
 
 .PHONY: clean
 clean:
 	@echo "================================================="
 	@echo "Cleaning dfimage"
 	@echo "=================================================\n"
-	@for OS in darwin linux; do \
-		if [ -f $${OS}/dfimage ]; then \
-			rm -f $${OS}/dfimage; \
-		fi; \
-	done
+	@if [ -f bin/dfimage ]; then \
+		rm -f bin/dfimage; \
+	fi; \
 
 .PHONY: clean-all
 clean-all: clean
